@@ -1,3 +1,4 @@
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
@@ -10,6 +11,12 @@ class RentalData(BaseModel):
     inventory_id: int
     staff_id: int
 
+class PaymentData(BaseModel):
+    customer_id: int
+    staff_id: int
+    amount: float
+    rental_id: Optional[int] = None
+
 DATABASE_URL = "postgresql+psycopg2://postgres:postgres@127.0.0.1:5434/pagila"
 
 engine = create_engine(DATABASE_URL, isolation_level="READ COMMITTED")
@@ -19,7 +26,6 @@ def create_rental(rental: RentalData):
     try:
         with engine.connect() as conn:
             with conn.begin(): 
-                
                 lock_query = text("SELECT inventory_id FROM inventory WHERE inventory_id = :inv_id FOR UPDATE;")
                 result = conn.execute(lock_query, {"inv_id": rental.inventory_id}).fetchone()
                 
@@ -87,6 +93,48 @@ def return_rental(rental_id: int):
                 conn.execute(update_query, {"rent_id": rental_id})
 
                 return {"mensaje": "Devolución registrada exitosamente.", "rental_id": rental_id}
+
+    except HTTPException:
+        raise
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=f"Error de base de datos: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
+
+@app.post("/payments")
+def create_payment(payment: PaymentData):
+    try:
+        with engine.connect() as conn:
+            with conn.begin():
+                if payment.rental_id is not None:
+                    check_query = text("""
+                        SELECT customer_id FROM rental 
+                        WHERE rental_id = :rent_id;
+                    """)
+                    renta = conn.execute(check_query, {"rent_id": payment.rental_id}).fetchone()
+
+                    if not renta:
+                        raise HTTPException(status_code=404, detail=f"La renta {payment.rental_id} no existe.")
+                    
+                    if renta.customer_id != payment.customer_id:
+                        raise HTTPException(
+                            status_code=403, 
+                            detail="Prohibido: Esta renta pertenece a otro cliente. No puedes pagarla."
+                        )
+
+                insert_query = text("""
+                    INSERT INTO payment (customer_id, staff_id, rental_id, amount, payment_date)
+                    VALUES (:cust_id, :staff_id, :rent_id, :amount, NOW()) RETURNING payment_id;
+                """)
+                
+                nuevo_payment_id = conn.execute(insert_query, {
+                    "cust_id": payment.customer_id,
+                    "staff_id": payment.staff_id,
+                    "rent_id": payment.rental_id,
+                    "amount": payment.amount
+                }).scalar()
+
+                return {"mensaje": "Pago registrado exitosamente", "payment_id": nuevo_payment_id}
 
     except HTTPException:
         raise
