@@ -1,8 +1,12 @@
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
+from datetime import datetime   
+from . import models
+from .db import get_db          
 
 app = FastAPI(title="Pagila Rental API - Persona A")
 
@@ -19,47 +23,46 @@ class PaymentData(BaseModel):
 
 DATABASE_URL = "postgresql+psycopg2://postgres:postgres@127.0.0.1:5434/pagila"
 
-engine = create_engine(DATABASE_URL, isolation_level="READ COMMITTED")
+engine = create_engine(DATABASE_URL, isolation_level="REPEATABLE READ")
 
 @app.post("/rentals")
-def create_rental(rental: RentalData):
+def create_rental(rental: RentalData, db: Session = Depends(get_db)):
     try:
-        with engine.connect() as conn:
-            with conn.begin(): 
-                lock_query = text("SELECT inventory_id FROM inventory WHERE inventory_id = :inv_id FOR UPDATE;")
-                result = conn.execute(lock_query, {"inv_id": rental.inventory_id}).fetchone()
-                
-                if not result:
-                    raise HTTPException(status_code=404, detail="El inventory_id no existe en el catálogo.")
+     
+        inventory_item = db.query(models.Inventory)\
+            .filter(models.Inventory.inventory_id == rental.inventory_id)\
+            .with_for_update()\
+            .first()
 
-                check_query = text("""
-                    SELECT rental_id FROM rental 
-                    WHERE inventory_id = :inv_id AND return_date IS NULL;
-                """)
-                renta_activa = conn.execute(check_query, {"inv_id": rental.inventory_id}).fetchone()
-                
-                if renta_activa:
-                    raise HTTPException(status_code=409, detail="Conflicto: La película ya está rentada.")
+        if not inventory_item:
+            raise HTTPException(status_code=404, detail="Inventory item not found")
 
-                insert_query = text("""
-                    INSERT INTO rental (rental_date, inventory_id, customer_id, staff_id)
-                    VALUES (NOW(), :inv_id, :cust_id, :staff_id) RETURNING rental_id;
-                """)
-                
-                nuevo_rental_id = conn.execute(insert_query, {
-                    "inv_id": rental.inventory_id,
-                    "cust_id": rental.customer_id,
-                    "staff_id": rental.staff_id
-                }).scalar()
-                
-                return {"mensaje": "Renta creada exitosamente", "rental_id": nuevo_rental_id}
+        active_rental = db.query(models.Rental)\
+            .filter(
+                models.Rental.inventory_id == rental.inventory_id,
+                models.Rental.return_date == None
+            )\
+            .first()
 
-    except HTTPException:
-        raise
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=500, detail=f"Error de base de datos: {str(e)}")
+        if active_rental:
+            raise HTTPException(status_code=400, detail="Item is already rented")
+
+
+        db_rental = models.Rental(
+            inventory_id=rental.inventory_id,
+            customer_id=rental.customer_id,
+            staff_id=rental.staff_id,
+            rental_date=datetime.now()
+        )
+        
+        db.add(db_rental)
+        db.commit() 
+        db.refresh(db_rental)
+        return db_rental
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
+        db.rollback() 
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/returns/{rental_id}")
 def return_rental(rental_id: int):
