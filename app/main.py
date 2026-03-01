@@ -13,7 +13,7 @@ class RentalData(BaseModel):
 
 # --- CONFIGURACIÓN DE BASE DE DATOS (SQLAlchemy) ---
 # Formato: postgresql+psycopg2://usuario:contraseña@host:puerto/base_de_datos
-DATABASE_URL = "postgresql+psycopg2://postgres:postgres@localhost:5432/pagila"
+DATABASE_URL = "postgresql+psycopg2://postgres:postgres@localhost:5434/pagila"
 
 # Creamos el "Engine" (El motor que maneja las conexiones). 
 # Aquí cumplimos la restricción del nivel de aislamiento.
