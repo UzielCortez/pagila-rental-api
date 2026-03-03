@@ -6,7 +6,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from datetime import datetime   
 from . import models
-from .db import get_db          
+from .db import get_db      
+import time  
+from sqlalchemy.exc import DBAPIError 
 
 app = FastAPI(title="Pagila Rental API - Persona A")
 
@@ -27,42 +29,77 @@ engine = create_engine(DATABASE_URL, isolation_level="REPEATABLE READ")
 
 @app.post("/rentals")
 def create_rental(rental: RentalData, db: Session = Depends(get_db)):
-    try:
-     
-        inventory_item = db.query(models.Inventory)\
-            .filter(models.Inventory.inventory_id == rental.inventory_id)\
-            .with_for_update()\
-            .first()
+    max_retries = 3
+    
+    # Iniciamos el bucle de intentos (Retry Logic)
+    for attempt in range(max_retries):
+        try:
+            # 1. Bloqueo Pesimista (SELECT ... FOR UPDATE)
+            # Buscamos el inventario y bloqueamos la fila para que nadie más la toque
+            inventory = db.query(models.Inventory).filter(
+                models.Inventory.inventory_id == rental.inventory_id
+            ).with_for_update().first()
 
-        if not inventory_item:
-            raise HTTPException(status_code=404, detail="Inventory item not found")
+            # Validación 1: ¿Existe el inventario?
+            if not inventory:
+                raise HTTPException(status_code=404, detail="Inventory not found")
 
-        active_rental = db.query(models.Rental)\
-            .filter(
+            # Validación 2: Lógica de Negocio (¿Ya está rentado?)
+            # Buscamos si hay una renta activa (return_date es NULL)
+            active_rental = db.query(models.Rental).filter(
                 models.Rental.inventory_id == rental.inventory_id,
                 models.Rental.return_date == None
-            )\
-            .first()
+            ).first()
 
-        if active_rental:
-            raise HTTPException(status_code=400, detail="Item is already rented")
+            if active_rental:
+                # Si ya está rentado, lanzamos error 400 y salimos.
+                # No necesitamos reintentar aquí porque es una regla de negocio.
+                raise HTTPException(status_code=400, detail="Item is already rented")
 
+            # 2. Crear la nueva renta
+            new_rental = models.Rental(
+                rental_date=datetime.now(),
+                inventory_id=rental.inventory_id,
+                customer_id=rental.customer_id,
+                staff_id=rental.staff_id
+            )
 
-        db_rental = models.Rental(
-            inventory_id=rental.inventory_id,
-            customer_id=rental.customer_id,
-            staff_id=rental.staff_id,
-            rental_date=datetime.now()
-        )
-        
-        db.add(db_rental)
-        db.commit() 
-        db.refresh(db_rental)
-        return db_rental
+            db.add(new_rental)
+            
+            # 3. Commit (Aquí es donde Postgres podría lanzar el Deadlock)
+            db.commit()
+            db.refresh(new_rental)
+            
+            # Si llegamos aquí, todo fue éxito. Retornamos y rompemos el bucle.
+            return new_rental
 
-    except Exception as e:
-        db.rollback() 
-        raise HTTPException(status_code=500, detail=str(e))
+        except DBAPIError as e:
+            # Si ocurre un error de base de datos, hacemos rollback primero
+            db.rollback()
+            
+            # Convertimos el error a texto para buscar las palabras clave
+            error_msg = str(e).lower()
+            
+            # Verificamos si es un Deadlock (código 40P01) o Error de Serialización (40001)
+            if "deadlock" in error_msg or "serialization" in error_msg:
+                # Si nos quedan intentos, esperamos y volvemos a probar
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)  # Espera de 0.5 segundos (Backoff)
+                    print(f"⚠️ Conflicto de concurrencia (Deadlock). Reintentando... ({attempt+1}/{max_retries})")
+                    continue 
+            
+            # Si no fue deadlock o se acabaron los intentos, lanzamos error 500 real
+            raise HTTPException(status_code=500, detail="Database concurrency error")
+            
+        except HTTPException as he:
+            # Si fue un error 400 o 404 generado por nosotros, lo dejamos pasar
+            db.rollback()
+            raise he
+            
+        except Exception as e:
+            # Cualquier otro error inesperado
+            db.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/returns/{rental_id}")
 def return_rental(rental_id: int):
